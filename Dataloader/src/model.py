@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 class PositionalEncoding(nn.Module):
@@ -22,84 +23,191 @@ class PositionalEncoding(nn.Module):
         # x: [batch_size, seq_len, d_model]
         return x + self.pe[:, :x.size(1), :]
 
-class TransformerPredictor(nn.Module):
-    def __init__(self, input_dim=9, output_dim=6, d_model=64, nhead=8, 
-                 num_encoder_layers=3, num_decoder_layers=3, dim_feedforward=256, dropout=0.1):
-        super(TransformerPredictor, self).__init__()
+class FeatureEncoder(nn.Module):
+    """特征编码器，将物理特征转换为嵌入表示"""
+    def __init__(self, energy_dim=1, atomic_dim=4, mfp_dim=4, engineered_dim=16, d_model=128, dropout=0.1):
+        super(FeatureEncoder, self).__init__()
         
-        # 物理特征处理层
+        # 特征嵌入
         self.energy_embedding = nn.Sequential(
-            nn.Linear(1, d_model // 4),
-            nn.ReLU(),
-            nn.BatchNorm1d(d_model // 4),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 4, d_model // 4)
+            nn.Linear(energy_dim, d_model // 8),
+            nn.GELU(),
+            nn.LayerNorm(d_model // 8),
+            nn.Dropout(dropout)
         )
         
-        self.material_embedding = nn.Sequential(
-            nn.Linear(4, d_model // 4),
-            nn.ReLU(),
-            nn.BatchNorm1d(d_model // 4),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 4, d_model // 4)
+        self.atomic_embedding = nn.Sequential(
+            nn.Linear(atomic_dim, d_model // 4),
+            nn.GELU(),
+            nn.LayerNorm(d_model // 4),
+            nn.Dropout(dropout)
         )
         
         self.mfp_embedding = nn.Sequential(
-            nn.Linear(4, d_model // 4),
-            nn.ReLU(),
-            nn.BatchNorm1d(d_model // 4),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 4, d_model // 4)
+            nn.Linear(mfp_dim, d_model // 4),
+            nn.GELU(),
+            nn.LayerNorm(d_model // 4),
+            nn.Dropout(dropout)
         )
         
-        # 特征交互层
-        self.interaction_layer = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.ReLU(),
-            nn.BatchNorm1d(d_model * 2),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model)
+        self.engineered_embedding = nn.Sequential(
+            nn.Linear(engineered_dim, d_model // 2),
+            nn.GELU(),
+            nn.LayerNorm(d_model // 2),
+            nn.Dropout(dropout)
         )
+        
+        # 特征交叉注意力
+        self.feature_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=4,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # 特征融合
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, energy, atomic, mfp, engineered):
+        # 嵌入特征
+        energy_embed = self.energy_embedding(energy)
+        atomic_embed = self.atomic_embedding(atomic)
+        mfp_embed = self.mfp_embedding(mfp)
+        engineered_embed = self.engineered_embedding(engineered)
+        
+        # 特征融合
+        combined = torch.cat([energy_embed, atomic_embed, mfp_embed, engineered_embed], dim=1)
+        
+        # 添加序列维度并进行自注意力
+        combined = combined.unsqueeze(1)  # [batch_size, 1, d_model]
+        
+        # 自注意力处理
+        attn_output, _ = self.feature_attention(combined, combined, combined)
+        
+        # 特征融合
+        output = self.feature_fusion(attn_output.squeeze(1))
+        
+        return output
+
+class PhysicsConstraintLayer(nn.Module):
+    """物理约束层，确保输出符合物理规律"""
+    def __init__(self, d_model, dropout=0.1):
+        super(PhysicsConstraintLayer, self).__init__()
+        
+        self.constraint_net = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.LayerNorm(d_model * 2),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model)
+        )
+    
+    def forward(self, x):
+        # 应用物理约束
+        return self.constraint_net(x) + x  # 残差连接
+
+class TransformerEncoderWithPhysics(nn.Module):
+    """带有物理约束的Transformer编码器层"""
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
+        super(TransformerEncoderWithPhysics, self).__init__()
+        
+        # 标准Transformer编码器层
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
         
         # 物理约束层
-        self.physics_constraint = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.BatchNorm1d(d_model),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model)
-        )
+        self.physics_layer = PhysicsConstraintLayer(d_model, dropout)
         
-        # 特征融合层
-        self.feature_fusion = nn.Linear(d_model, d_model)
+        # 激活函数
+        self.activation = nn.GELU()
+    
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        # 多头自注意力
+        src2, _ = self.self_attn(src, src, src, attn_mask=src_mask,
+                              key_padding_mask=src_key_padding_mask)
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        
+        # 前馈网络
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        
+        # 物理约束
+        src = self.physics_layer(src)
+        
+        return src
+
+class TransformerPredictor(nn.Module):
+    def __init__(self, input_dim=41, output_dim=6, d_model=256, nhead=8, 
+                 num_encoder_layers=6, dim_feedforward=1024, dropout=0.1):
+        super(TransformerPredictor, self).__init__()
+        
+        # 保存模型参数
+        self.d_model = d_model
+        self.input_dim = input_dim
+        
+        # 特征分离
+        self.energy_dim = 1
+        self.atomic_dim = 4
+        self.mfp_dim = 4
+        self.engineered_dim = input_dim - 1 - 4 - 4  # 工程特征维度
+        
+        # 特征编码器
+        self.feature_encoder = FeatureEncoder(
+            energy_dim=self.energy_dim,
+            atomic_dim=self.atomic_dim,
+            mfp_dim=self.mfp_dim,
+            engineered_dim=self.engineered_dim,
+            d_model=d_model,
+            dropout=dropout
+        )
         
         # 位置编码
         self.pos_encoder = PositionalEncoding(d_model)
         
-        # Transformer编码器和解码器
-        self.transformer_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, 
-                                      dim_feedforward=dim_feedforward, dropout=dropout,
-                                      batch_first=True),
-            num_layers=num_encoder_layers
+        # Transformer编码器层
+        self.encoder_layers = nn.ModuleList([
+            TransformerEncoderWithPhysics(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout
+            ) for _ in range(num_encoder_layers)
+        ])
+        
+        # 输出预测层
+        self.output_layers = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.LayerNorm(d_model // 2),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, output_dim)
         )
         
-        self.transformer_decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(d_model=d_model, nhead=nhead, 
-                                      dim_feedforward=dim_feedforward, dropout=dropout,
-                                      batch_first=True),
-            num_layers=num_decoder_layers
-        )
-        
-        # 输出层
-        self.output_projection = nn.Linear(d_model, output_dim)
+        # 针对不同输出的专注层
+        self.scatter_attention = nn.Linear(d_model, 3)
+        self.no_scatter_attention = nn.Linear(d_model, 3)
         
         # 初始化参数
         self._init_parameters()
-        
-        # 模型维度
-        self.d_model = d_model
-        
+    
     def _init_parameters(self):
         """初始化模型参数"""
         for p in self.parameters():
@@ -116,50 +224,44 @@ class TransformerPredictor(nn.Module):
         Returns:
             输出预测 [batch_size, output_dim]
         """
-        # 分离物理特征
+        # 特征分离
         energy = src[:, 0:1]  # 能量
         atomic_numbers = src[:, [1,3,5,7]]  # 原子序数
         mfp_values = src[:, [2,4,6,8]]  # 自由程
+        engineered_features = src[:, 9:]  # 工程特征
         
-        # 特征嵌入
-        energy_features = self.energy_embedding(energy)
-        material_features = self.material_embedding(atomic_numbers)
-        thickness_features = self.mfp_embedding(mfp_values)
+        # 特征编码
+        x = self.feature_encoder(energy, atomic_numbers, mfp_values, engineered_features)
         
-        # 特征融合
-        combined_features = torch.cat([energy_features, material_features, thickness_features], dim=1)
-        src = self.feature_fusion(combined_features)
+        # 扩展序列维度并添加位置编码
+        # 将特征转换为序列形式 [batch_size, seq_len=1, d_model]
+        x = x.unsqueeze(1)
+        x = self.pos_encoder(x)
         
-        # 添加特征交互
-        src = self.interaction_layer(src)
+        # 通过Transformer编码器层
+        for encoder_layer in self.encoder_layers:
+            x = encoder_layer(x)
         
-        # 应用物理约束
-        src = self.physics_constraint(src)
+        # 去除序列维度 [batch_size, d_model]
+        x = x.squeeze(1)
         
-        # 缩放并添加位置编码
-        src = src.unsqueeze(1) * math.sqrt(self.d_model)
-        src = self.pos_encoder(src)
+        # 输出预测
+        # 分别为不同类型的累积因子生成注意力权重
+        no_scatter_attn = F.softmax(self.no_scatter_attention(x), dim=1)
+        scatter_attn = F.softmax(self.scatter_attention(x), dim=1)
         
-        # 通过编码器 (batch_first=True，不需要调整维度顺序)
-        memory = self.transformer_encoder(src)
+        # 生成最终预测
+        output = self.output_layers(x)
         
-        # 创建目标序列或使用传入的目标
-        if tgt is None:
-            # 推理模式：使用全零向量作为初始目标
-            tgt = torch.zeros(src.size(0), src.size(1), self.d_model, device=src.device)
-        else:
-            # 训练模式：使用真实目标
-            tgt = tgt.unsqueeze(1)  # [batch_size, 1, output_dim]
-            tgt = nn.Linear(tgt.size(-1), self.d_model).to(src.device)(tgt) * math.sqrt(self.d_model)
-            tgt = self.pos_encoder(tgt)
+        # 分离不同类型的预测
+        no_scatter_pred = output[:, :3]
+        scatter_pred = output[:, 3:]
         
-        # 通过解码器 (batch_first=True，不需要调整维度顺序)
-        output = self.transformer_decoder(tgt, memory)
+        # 应用注意力机制
+        no_scatter_pred = no_scatter_pred * no_scatter_attn
+        scatter_pred = scatter_pred * scatter_attn
         
-        # 投影到输出维度 [batch_size, 1, output_dim]
-        output = self.output_projection(output)
-        
-        # 去除序列维度 [batch_size, output_dim]
-        output = output.squeeze(1)
+        # 组合预测结果
+        output = torch.cat([no_scatter_pred, scatter_pred], dim=1)
         
         return output

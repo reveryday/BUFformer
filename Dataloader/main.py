@@ -55,7 +55,7 @@ def main():
     
     # 初始化数据处理器
     data_processor = DataProcessor(args.data_path, batch_size=args.batch_size)
-    train_loader, test_loader = data_processor.load_data()
+    train_loader, val_loader, test_loader = data_processor.load_data()
     
     # 初始化模型
     model = TransformerPredictor(
@@ -78,6 +78,7 @@ def main():
         trainer = Trainer(
             model=model,
             train_loader=train_loader,
+            val_loader=val_loader,
             test_loader=test_loader,
             data_processor=data_processor,
             learning_rate=args.learning_rate,
